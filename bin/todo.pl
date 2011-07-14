@@ -16,7 +16,6 @@ emulates the interface of Lifehacker.com's todo.sh script.
 use App::Todo;
 use Config;
 use Encode ();
-use YAML ();
 use LWP::UserAgent;
 use Number::RecordLocator;
 use Getopt::Long;
@@ -24,6 +23,27 @@ use Pod::Usage;
 use Email::Address;
 use Fcntl qw(:mode);
 use File::Temp;
+use Digest::MD5 qw(md5_hex);
+
+BEGIN {
+    local $@;
+    no strict 'refs';
+    no warnings 'once';
+
+    if ( eval { require YAML::Syck; YAML::Syck->VERSION(0.71) } ) {
+        $YAML::Syck::ImplicitUnicode++;
+        *Load     = *YAML::Syck::Load;
+        *Dump     = *YAML::Syck::Dump;
+        *LoadFile = *YAML::Syck::LoadFile;
+        *DumpFile = *YAML::Syck::DumpFile;
+    } else {
+        require YAML;
+        *Load     = *YAML::Load;
+        *Dump     = *YAML::Dump;
+        *LoadFile = *YAML::LoadFile;
+        *DumpFile = *YAML::DumpFile;
+    }
+}
 
 our $CONFFILE = "$ENV{HOME}/.hiveminder";
 our $VERSION = $App::Todo::VERSION;
@@ -175,7 +195,7 @@ sub check_config_perms {
 
 sub load_config {
     return unless(-e $CONFFILE);
-    %config = %{YAML::LoadFile($CONFFILE) || {}};
+    %config = %{LoadFile($CONFFILE) || {}};
     my $sid = $config{sid};
     if($sid) {
         my $uri = URI->new($config{site});
@@ -232,7 +252,7 @@ END_WELCOME
 }
 
 sub save_config {
-    YAML::DumpFile($CONFFILE, \%config);
+    DumpFile($CONFFILE, \%config);
     chmod 0600, $CONFFILE;
 }
 
@@ -279,19 +299,19 @@ sub list_tasks {
     for my $t (@$tasks) {
         printf "#%4s ", $locator->encode($t->{id});
 
-        print colored('(' . priority_to_string($t->{priority}) . ') ',
-                      priority_to_color($t->{priority}))
+        print colored('(' . priority_to_string($t->{priority}) . ')',
+                      priority_to_color($t->{priority})), ' '
             if $t->{priority} != 3;
 
         print colored($t->{summary}, priority_to_color($t->{priority}));
         
-        print colored(" (Due " . $t->{due} . ")",
-                      (overdue($t->{due}) ? 'magenta' : 'dark'))
+        print ' ', colored("(Due " . $t->{due} . ")",
+                           (overdue($t->{due}) ? 'magenta' : 'dark'))
             if $t->{due};
 
-        print color('dark');
         if ($t->{tags}) {
-            print ' [' . $t->{tags} . ']';
+            print color('reset'), ' ', color('dark');
+            print '[' . $t->{tags} . ']';
         }
 
         $t->{owner} =~ s/<nobody>/<nobody\@localhost>/;
@@ -303,7 +323,8 @@ sub list_tasks {
         my $not_owner = lc $owner->address ne lc $config{email};
         my $not_requestor = lc $requestor->address ne lc $config{email};
         if( $t->{group} || $not_owner || $not_requestor ) {
-            print ' (';
+            print color('reset'), ' ', color('dark');
+            print '(';
             print join(", ",
                        $t->{group} || "personal",
                        $not_requestor ? "for " . $requestor->name : (),
@@ -558,9 +579,18 @@ with the server.
 
 sub do_login {
     return 1 if $config{sid};
-    my $result = call(Login =>
-                      address  => $config{email},
-                      password => $config{password});
+    my $result = call(GeneratePasswordToken =>
+                      address => $config{email});
+    if ($result->{failure}) {
+        die $result->{message};
+    }
+    my $salt = $result->{_content}{salt};
+    my $token = $result->{_content}{token};
+    my $hashed_password = md5_hex($token . ' ' . md5_hex($config{password} . $salt));
+    $result = call(Login =>
+                   address => $config{email},
+                   hashed_password => $hashed_password,
+                   token => $token);
     if(!$result->{failure}) {
         $config{sid} = get_session_id();
         save_config();
@@ -585,7 +615,7 @@ sub download_tasks {
         die $result->{message};
     }
 
-    return YAML::Load($result->{_content}{result});
+    return Load($result->{_content}{result});
 }
 
 sub call ($@) {
@@ -601,7 +631,7 @@ sub call ($@) {
     );
 
     if ( $res->is_success ) {
-        return YAML::Load( Encode::decode_utf8($res->content) )->{$moniker};
+        return Load( Encode::decode_utf8($res->content) )->{$moniker};
     } else {
         die $res->status_line;
     }
@@ -631,7 +661,7 @@ sub result_ok {
         do_login() or die("Bad username/password -- edit $CONFFILE and try again.");
         $commands{$command}->();
     } else {
-        my $death = YAML::Dump($result);
+        my $death = Dump($result);
         $death .= "\n$error\n" if defined $error;
         die $death;
     }
@@ -722,7 +752,7 @@ sub supports_color {
         return 1 if not $@;
     }
     else {
-        return 1 if $ENV{'TERM'} =~ /^(xterm|rxvt|linux|ansi)/;
+        return 1 if $ENV{'TERM'} =~ /^(xterm|rxvt|linux|ansi|screen)/;
         return 1 if $ENV{'COLORTERM'};
     }
     return 0; 
